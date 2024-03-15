@@ -1,0 +1,44 @@
+# Mac File Management
+.DS_Store
+
+# IPython Notebook
+.ipynb_checkpoints
+
+# Python
+__pycache__
+*.egg-info
+
+# R
+.RData
+.Rhistory
+*.Rproj*
+
+# Matlab
+*.m~
+.~lock.*
+*.asv
+
+# LaTex
+*.sav
+*.bak
+*.aux
+*.pdf
+*.bbl
+*.blg
+*.log
+*.out
+*.spl
+*.gz
+*.ps
+*.dvi
+_region_.*
+
+# vi
+*.swp
+
+# ignore html files
+/scripts/numpyro_model_exploration_files/*
+figures/m1_graph
+figures/m2_graph
+figures/m3_graph
+scripts/numpyro_model_exploration.html

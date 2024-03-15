@@ -1,0 +1,899 @@
+---
+title: Numpyro modelling of psychometric functions
+author: Thomas Wallis
+jupyter: python3
+format:
+    html:
+     echo: true
+     toc: true
+    #ipynb: 
+    # echo: true 
+---
+
+
+```{python}
+import pandas as pd
+
+import plotnine as pn
+
+import pickle
+import lzma 
+
+import numpy as np
+import arviz as az
+import matplotlib.pyplot as plt
+
+import jax.numpy as jnp
+from jax import random
+
+from itertools import product
+
+import numpyro
+from numpyro.diagnostics import hpdi
+
+from src.helpers import get_top_directory, preprocess_data 
+from src.numpyro_models import PsychometricFunctionWrapper, SinglePsychometricFunction, ParticipantsAllConditions, ParticipantsAllConditionsAndImages, expand_grid, group_bernoulli_trials_into_binomial, plot_psychometric_function
+
+numpyro.set_platform("cpu")
+numpyro.set_host_device_count(4)
+
+%load_ext autoreload
+%autoreload 2
+```
+
+```{python}
+
+plot_colors = ["#7FAB16", "#004E8A"]
+top_dir = get_top_directory()
+df = preprocess_data()
+df.info()
+
+```
+
+# General modelling specification
+
+We follow here the notation of Schütt et al., 2016. The psychometric function is 
+
+$\bar p = \Psi(x; m, w, \gamma, \lambda) = \gamma + (1 - \gamma - \lambda) S(x; m, w)$
+
+Since we're operating on contrast values, and these are best described in magnitude terms, we use the Weibull psychometric function:
+
+$S(x; m, w) = 1 - \exp(\log(0.5) e ^ {C \frac{\log(x) - m}{w}})$,
+
+where $C = \log(-\log(0.05)) - \log(-\log(0.95))$.
+
+Note that this form means that the threshold parameter $m$ and width parameter $w$ are in log units.
+
+These functions have been implemented in the importable files `src/numpyro_models.py`.
+
+# Data overview: two participants at different grains, reach values
+
+```{python}
+# create a binomial grouped data structure:
+grouped_df = group_bernoulli_trials_into_binomial(
+    df,
+    stimulus_intensity="reach",
+    experiment_conditions=["grain", "image_condition"],
+    group_variables=["participant"],
+    bernoulli_outcome_column="correct",
+    use_rule_of_succession=True,
+)
+grouped_df = grouped_df.dropna()
+grouped_df
+```
+
+```{python}
+plt_1 = (
+    pn.ggplot(
+        data=grouped_df,
+        mapping=pn.aes(
+            x="reach",
+            fill="image_condition",
+            color="image_condition",
+        ),
+    )
+    + pn.facet_grid("participant ~ grain")
+    + pn.geom_errorbar(mapping=pn.aes(ymin="plot_lo", ymax="plot_hi"), width=0.0)
+    + pn.geom_point(mapping=pn.aes(y="proportion_correct"), color="black")
+    + pn.scale_x_log10()
+    + pn.labs(x="Reach", y="P(correct)", color="", fill="")
+    + pn.scale_color_manual(plot_colors)
+    + pn.scale_fill_manual(plot_colors)
+    + pn.theme_bw()
+)
+plt_1.save(top_dir / "figures" / "raw_psychometric_data.pdf", width=8, height=5)
+plt_1.draw()
+```
+
+# Demo one fit to one cell of data
+
+Here I will first demo a single psychometric function fit to one "cell" of the data (one participant, condition, etc). 
+This is essentially what psignifit 4.0 is doing, with the important exception that here I am using a binomial likelihood instead of the beta-binomial. 
+(It would in principle be possible to do this but I haven't implemented it yet).
+
+```{python}
+subset_df = grouped_df.loc[
+    (grouped_df.participant == "participant_1")
+    & (grouped_df.grain == 3.0)
+    & (grouped_df.image_condition == "scenes")
+    # (grouped_df.participant == "participant_0")
+    # & (grouped_df.grain == 5.0)
+    # & (grouped_df.image_condition == "scenes")
+]
+subset_df
+```
+
+## Model setup and sampling
+
+To see the code that actually defines the model, look into the `model` method of the `SinglePsychometricFunction` class.
+
+Set up the model instance:
+
+```{python}
+rng_key = random.PRNGKey(42)
+m1 = SinglePsychometricFunction(
+    data=subset_df, rng_key=rng_key, intensity_variable_name="reach"
+)
+```
+
+Unfortunately rendering the model graph doesn't seem to work with this version of jax:
+
+```{python}
+# render the model! (requires graphviz on system level)
+m1_graph = numpyro.render_model(
+    m1.model,
+    render_distributions=True,
+    render_params=True,
+)
+m1_graph.render(top_dir / "figures" / "m1_graph")
+m1_graph
+```
+
+Sample from this model for all data:
+
+```{python}
+m1.sample()
+```
+
+```{python}
+m1.mcmc.print_summary(0.90)
+```
+
+## Plot prior and posterior samples
+
+Generate prior and posterior predictive samples from model. 
+
+```{python}
+x = jnp.logspace(jnp.log10(0.3), jnp.log10(16), 101)
+new_df = pd.DataFrame({"reach": x})
+prior_samples = m1.predict(data=new_df, prior=True, sample_obs=False)
+posterior_samples = m1.predict(data=new_df, prior=False, sample_obs=False)
+post_pred_mean = posterior_samples["psi"].mean(axis=0)
+post_pred_hpdi = hpdi(posterior_samples["psi"], 0.9)
+new_df["post_mean"] = post_pred_mean
+new_df["post_lower"] = post_pred_hpdi[0]
+new_df["post_upper"] = post_pred_hpdi[1]
+
+```
+
+Plot prior samples to see what sorts of curves are implied by our prior:
+
+```{python}
+
+prior_samples_df = expand_grid(
+    {"reach": x, "sample": range(prior_samples["psi"].shape[0])}
+)
+prior_samples_df["yhat"] = prior_samples["psi"].reshape(
+    len(prior_samples_df), order="F"
+)
+prior_samples_df["reach"] = prior_samples_df["reach"].astype(float)
+
+plt_prior_samples = (
+    (
+        pn.ggplot(
+            data=prior_samples_df, mapping=pn.aes(x="reach", y="yhat", group="sample")
+        )
+    )
+    + pn.geom_line(alpha=0.5, color=plot_colors[1])
+    + pn.scale_x_log10()
+    + pn.theme_bw()
+    + pn.labs(x="Reach", y="Predicted proportion correct")
+)
+
+plt_prior_samples.save(top_dir / "figures" / "prior_samples.pdf", width=5, height=4)
+plt_prior_samples.draw()
+```
+
+Plot the mean and HPDI of the psychometric curve:
+
+```{python}
+plt_2 = (
+    pn.ggplot(
+        data=subset_df,
+        mapping=pn.aes(
+            x="reach",
+        ),
+    )
+    + pn.geom_ribbon(
+        data=new_df,
+        mapping=pn.aes(
+            ymin="post_lower",
+            ymax="post_upper",
+        ),
+        color=None,
+        outline_type="full",
+        alpha=0.4,
+    )
+    + pn.geom_line(
+        data=new_df,
+        mapping=pn.aes(y="post_mean"),
+        alpha=0.5,
+    )
+    + pn.geom_errorbar(mapping=pn.aes(ymin="plot_lo", ymax="plot_hi"), width=0.0)
+    + pn.geom_point(mapping=pn.aes(y="proportion_correct"), color="black")
+    + pn.scale_x_log10()
+    + pn.labs(x="Reach", y="P(correct)", color="", fill="")
+    + pn.theme_bw()
+)
+
+plt_2.save(top_dir / "figures" / "single_psychometric_function.pdf", width=5, height=4)
+plt_2.draw()
+```
+
+## Examine parameter distributions
+
+Plot parameter distributions using [arviz](https://python.arviz.org/en/latest/index.html):
+
+```{python}
+az.plot_trace(m1.mcmc, var_names=["m", "log_w", "lam"])
+plt.show()
+```
+
+Plot prior vs posterior for threshold `m`:
+
+```{python}
+model_list = [m1.arviz_data["posterior"], m1.arviz_data["prior"]]
+model_names = ["Posterior", "Prior"]
+
+fig, ax = plt.subplots(1, 1, figsize=(8, 5), layout="constrained")
+ax = az.plot_forest(
+    model_list,
+    model_names=model_names,
+    kind="forestplot",
+    var_names=["m", "log_w"],
+    hdi_prob=0.9,
+    combined=True,
+    ridgeplot_overlap=1.5,
+    ax=ax,
+)
+ax[0].set_title("Threshold / width [log units]")
+plt.show()
+
+```
+
+# Separate fits to each cell
+
+With this single-condition model, we're now going to loop over each cell of the data, fitting each one, and storing the results.
+This will allow us to compare the multi-level model fit below.
+
+Note that here I'm going to do this in a separate script, in order to reduce the compute time for this notebook.
+See the code in `fit_single_cells.py` to see how this works.
+We can just load this file up:
+
+```{python}
+data_file = top_dir / "results" / "single_psychometric_fits.xz"
+with lzma.open(data_file, "r") as f:
+    tmp = f.read()
+    model_dict, pred_df = pickle.loads(tmp)
+
+model_dict
+
+```
+
+## Plot individual psychometric functions
+
+```{python}
+
+plt_3 = plt_1
+plt_3 = (
+    plt_3
+    + pn.geom_ribbon(
+        data=pred_df,
+        mapping=pn.aes(
+            ymin="post_lower",
+            ymax="post_upper",
+        ),
+        color=None,
+        outline_type="full",
+        alpha=0.4,
+    )
+    + pn.geom_line(
+        data=pred_df,
+        mapping=pn.aes(y="post_mean"),
+        alpha=0.5,
+    )
+)
+
+plt_3.save(top_dir / "figures" / "m0_psychometric_functions.pdf", width=8, height=5)
+plt_3.draw()
+```
+
+## Plot parameter estimates
+
+Pull out info into lists:
+
+```{python}
+model_list = []
+model_names = []
+for participant, grain, image_condition in model_dict.keys():
+    model_list.append(
+        model_dict[(participant, grain, image_condition)]["model"].arviz_data
+    )
+    model_names.append(f"{participant}, {grain}, {image_condition}")
+
+```
+
+### Plot threshold estimates
+
+```{python}
+fig, ax = plt.subplots(1, 1, figsize=(12, 5), layout="constrained")
+ax = az.plot_forest(
+    model_list,
+    model_names=model_names,
+    kind="forestplot",
+    var_names=["m"],
+    transform=np.exp,
+    hdi_prob=0.9,
+    combined=True,
+    ridgeplot_overlap=1.5,
+    ax=ax,
+)
+ax[0].set_title("Reach threshold")
+plt.show()
+```
+
+We could do more plots of the different parameters of course, but this becomes more relevant when we're comparing to other models below.
+
+# Multilevel model with participants in conditions
+
+Now we're going to do a multilevel model with participants acting in conditions.
+
+We create a new grouped df dataframe here, ungrouping by source image, in order to compare to the image-random effects model below. 
+Note that this is not strictly necessary for this model and actually makes the sampling less efficient.
+
+```{python}
+# create a binomial grouped data structure:
+grouped_image_df = group_bernoulli_trials_into_binomial(
+    df,
+    stimulus_intensity="reach",
+    experiment_conditions=["grain", "image_condition"],
+    group_variables=["participant", "image_name"],
+    bernoulli_outcome_column="correct",
+    use_rule_of_succession=True,
+)
+grouped_image_df = grouped_image_df.dropna()
+grouped_image_df
+```
+
+```{python}
+rng_key = random.PRNGKey(42)
+m2 = ParticipantsAllConditions(
+    data=grouped_image_df,
+    rng_key=rng_key,
+    intensity_variable_name="reach",
+    experiment_conditions=["image_condition", "grain"],
+    group_variables=["participant"],
+    use_reparam=True,
+)
+```
+
+
+```{python}
+# render the model! (requires graphviz on system level)
+
+# note to simplify we will exclude the reparam:
+m2_tmp = ParticipantsAllConditions(
+    data=grouped_image_df,
+    rng_key=rng_key,
+    intensity_variable_name="reach",
+    experiment_conditions=["image_condition", "grain"],
+    group_variables=["participant"],
+    use_reparam=False,
+)
+m2_graph = numpyro.render_model(
+    m2_tmp.model,
+    render_distributions=True,
+    render_params=True,
+)
+m2_graph.render(top_dir / "figures" / "m2_graph")
+m2_graph
+```
+
+## Sample the model and check the overall output
+
+Sample from this model for all data:
+
+```{python}
+m2.sample(num_warmup=4000, num_samples=2000)
+```
+
+```{python}
+m2.mcmc.print_summary(0.90)
+```
+
+Check that our participant offsets have mean of approx zero:
+
+```{python}
+for i, j in product(
+    range(len(grouped_df.image_condition.unique())),
+    range(len(grouped_df.grain.unique())),
+):
+    tmp = m2.posterior_samples["m_delta_participant"][:, i, j]
+    print(f"mean: {tmp.mean()}, var: {tmp.std()}")
+```
+
+## Plot psychometric functions
+
+First generate some example data and predictions.
+
+```{python}
+x = np.logspace(np.log10(0.3), np.log10(16), 51)
+pred_df = expand_grid(
+    {
+        "reach": x,
+        "participant": grouped_df["participant"].unique(),
+        "grain": grouped_df["grain"].unique(),
+        "image_condition": grouped_df["image_condition"].unique(),
+    }
+)
+pred_df, _ = PsychometricFunctionWrapper.create_grouping_ids(
+    pred_df,
+    experiment_conditions=["image_condition", "grain"],
+    group_variables=["participant"],
+)
+
+# prior_samples = m2.predict(data=pred_df, prior=True, sample_obs=False)
+posterior_samples = m2.predict(data=pred_df, prior=False, sample_obs=False)
+post_pred_mean = posterior_samples["psi"].mean(axis=0)
+post_pred_hpdi = hpdi(posterior_samples["psi"], 0.9)
+pred_df["post_mean"] = post_pred_mean
+pred_df["post_lower"] = post_pred_hpdi[0]
+pred_df["post_upper"] = post_pred_hpdi[1]
+
+plt_4 = plt_1
+plt_4 = (
+    plt_4
+    + pn.geom_ribbon(
+        data=pred_df,
+        mapping=pn.aes(
+            ymin="post_lower",
+            ymax="post_upper",
+        ),
+        color=None,
+        outline_type="full",
+        alpha=0.4,
+    )
+    + pn.geom_line(
+        data=pred_df,
+        mapping=pn.aes(y="post_mean"),
+        alpha=0.5,
+    )
+)
+plt_4.save(top_dir / "figures" / "m2_psychometric_functions.pdf", width=8, height=5)
+plt_4.draw()
+```
+
+Compare this plot to the independent version above.
+
+## Plot parameter estimates
+
+```{python}
+fig, ax = plt.subplots(1, 1, figsize=(12, 5), layout="constrained")
+ax = az.plot_forest(
+    [m2.arviz_data["posterior"], m2.arviz_data["prior"]],
+    model_names=["posterior", "prior"],
+    kind="forestplot",
+    var_names=["m_cond", "m_mu", "m_sigma"],
+    # transform=np.exp,
+    hdi_prob=0.9,
+    combined=True,
+    ridgeplot_overlap=1.5,
+    ax=ax,
+)
+ax[0].set_title("Reach threshold [log units]")
+plt.show()
+```
+
+```{python}
+fig, ax = plt.subplots(1, 1, figsize=(12, 5), layout="constrained")
+ax = az.plot_forest(
+    [m2.arviz_data["posterior"], m2.arviz_data["prior"]],
+    model_names=["posterior", "prior"],
+    kind="forestplot",
+    var_names=["log_w_cond", "log_w_mu", "log_w_sigma"],
+    # transform=np.exp,
+    hdi_prob=0.9,
+    combined=True,
+    ridgeplot_overlap=1.5,
+    ax=ax,
+)
+ax[0].set_title("Reach width [log units]")
+plt.show()
+```
+
+## Example difference estimate
+
+As an example for how we could now compare conditions, we could ask: what is the posterior distribution on the threshold difference between scenes and textures, averaging over grain?
+
+For the syntax from Arviz, see [here](https://python.arviz.org/en/stable/getting_started/WorkingWithInferenceData.html#compute-and-store-posterior-pushforward-quantities).
+
+```{python}
+# extract posterior to make this easier to work with:
+post = m2.arviz_data.posterior
+```
+
+Compute difference score for each image condition (exponentiating first to get `m` onto linear reach units):
+
+```{python}
+post["im_cond_diff_grains"] = np.exp(
+    post["m_cond"].sel(image_condition="textures")
+) - np.exp(post["m_cond"].sel(image_condition="scenes"))
+
+az.summary(post, var_names=["im_cond_diff_grains"], hdi_prob=0.9)
+```
+
+```{python}
+# difference score for each image condition over each grain
+axes = az.plot_posterior(
+    post,
+    var_names=["im_cond_diff_grains"],
+    hdi_prob=0.9,
+    figsize=(12, 6),
+)
+fig = axes.flatten()[0].get_figure()
+fig.suptitle("Reach threshold difference scores [log units]")
+plt.show()
+```
+
+Now compute the mean difference score over grains:
+
+```{python}
+post["im_cond_diff"] = post["im_cond_diff_grains"].mean(dim="grain")
+az.summary(post, var_names=["im_cond_diff"], hdi_prob=0.90)
+```
+
+```{python}
+axes = az.plot_posterior(
+    post,
+    var_names=["im_cond_diff"],
+    hdi_prob=0.9,
+    figsize=(12, 6),
+)
+plt.show()
+
+```
+
+In other words: averaging over grains and participants, reach thresholds for textures are on average 0.6 reach units higher than scenes (90% HDI 0.496 -- 0.705).
+
+# Multilevel model including image-level effects
+
+```{python}
+rng_key = random.PRNGKey(42)
+m3 = ParticipantsAllConditionsAndImages(
+    data=grouped_image_df,
+    rng_key=rng_key,
+    intensity_variable_name="reach",
+    experiment_conditions=["image_condition", "grain"],
+    group_variables=["participant", "image_name"],
+    use_reparam=True,
+)
+```
+
+
+```{python}
+# render the model! (requires graphviz on system level)
+# note to simplify we will exclude the reparam:
+m3_tmp = ParticipantsAllConditionsAndImages(
+    data=grouped_image_df,
+    rng_key=rng_key,
+    intensity_variable_name="reach",
+    experiment_conditions=["image_condition", "grain"],
+    group_variables=["participant", "image_name"],
+    use_reparam=False,
+)
+m3_graph = numpyro.render_model(
+    m3_tmp.model,
+    render_distributions=True,
+    render_params=True,
+)
+m3_graph.render(top_dir / "figures" / "m3_graph")
+m3_graph
+
+```
+
+## Sample the model and check the overall output
+
+Sample from this model for all data:
+
+```{python}
+m3.sample(num_warmup=4000, num_samples=2000)
+```
+
+```{python}
+m3.mcmc.print_summary(0.90)
+```
+
+## Plot psychometric functions
+
+```{python}
+x = np.logspace(np.log10(0.3), np.log10(16), 51)
+pred_df = expand_grid(
+    {
+        "reach": x,
+        "participant": grouped_df["participant"].unique(),
+        "grain": grouped_df["grain"].unique(),
+        "image_condition": grouped_df["image_condition"].unique(),
+    }
+)
+pred_df["image_name"] = "None"
+pred_df, _ = PsychometricFunctionWrapper.create_grouping_ids(
+    pred_df,
+    experiment_conditions=["image_condition", "grain"],
+    group_variables=["participant", "image_name"],
+)
+
+posterior_samples = m3.predict(
+    data=pred_df,
+    prior=False,
+    sample_obs=False,
+    model_kwargs={"include_participant_re": True, "include_image_re": False},
+)
+post_pred_mean = posterior_samples["psi"].mean(axis=0)
+post_pred_hpdi = hpdi(posterior_samples["psi"], 0.9)
+pred_df["post_mean"] = post_pred_mean
+pred_df["post_lower"] = post_pred_hpdi[0]
+pred_df["post_upper"] = post_pred_hpdi[1]
+
+plt_5 = plt_1
+plt_5 = (
+    plt_5
+    + pn.geom_ribbon(
+        data=pred_df,
+        mapping=pn.aes(
+            ymin="post_lower",
+            ymax="post_upper",
+        ),
+        color=None,
+        outline_type="full",
+        alpha=0.4,
+    )
+    + pn.geom_line(
+        data=pred_df,
+        mapping=pn.aes(y="post_mean"),
+        alpha=0.5,
+    )
+)
+
+plt_5.save(
+    top_dir / "figures" / "m3_psychometric_functions.pdf",
+    width=8,
+    height=5,
+)
+plt_5.draw()
+```
+
+
+## Plot parameter estimates
+
+### Thresholds
+
+```{python}
+fig, ax = plt.subplots(1, 1, figsize=(12, 5), layout="constrained")
+ax = az.plot_forest(
+    [m3.arviz_data["posterior"], m3.arviz_data["prior"]],
+    model_names=["posterior", "prior"],
+    kind="forestplot",
+    var_names=["m_cond", "m_mu", "m_sigma"],
+    # transform=np.exp,
+    hdi_prob=0.9,
+    combined=True,
+    ridgeplot_overlap=1.5,
+    ax=ax,
+)
+ax[0].set_title("Reach threshold [log units]")
+plt.show()
+```
+
+We can also look at the image-level offsets:
+
+```{python}
+
+# create a sorted variable:
+# https://python.arviz.org/en/stable/user_guide/label_guide.html#example-sorting-the-schools-by-mean
+image_means = m3.arviz_data["posterior"]["m_delta_image"].mean(("chain", "draw"))
+sorted_images = m3.arviz_data["posterior"]["image_name"].sortby(image_means)
+
+fig, ax = plt.subplots(1, 1, figsize=(8, 12), layout="constrained")
+ax = az.plot_forest(
+    m3.arviz_data["posterior"],
+    kind="forestplot",
+    var_names=["m_delta_image"],
+    coords={"image_name": sorted_images},
+    hdi_prob=0.9,
+    combined=True,
+    ridgeplot_overlap=1.5,
+    ax=ax,
+)
+ax[0].set_title("Reach threshold differences")
+plt.savefig(top_dir / "figures" / "m3_image_offsets.pdf")
+plt.show()
+```
+
+
+### Widths
+
+```{python}
+fig, ax = plt.subplots(1, 1, figsize=(12, 5), layout="constrained")
+ax = az.plot_forest(
+    [m2.arviz_data["posterior"], m2.arviz_data["prior"]],
+    model_names=["posterior", "prior"],
+    kind="forestplot",
+    var_names=["log_w_cond", "log_w_mu", "log_w_sigma"],
+    # transform=np.exp,
+    hdi_prob=0.9,
+    combined=True,
+    ridgeplot_overlap=1.5,
+    ax=ax,
+)
+ax[0].set_title("Reach width [log units]")
+plt.show()
+```
+
+Image-level offsets on width:
+
+```{python}
+
+# create a sorted variable:
+# https://python.arviz.org/en/stable/user_guide/label_guide.html#example-sorting-the-schools-by-mean
+image_means = m3.arviz_data["posterior"]["log_w_delta_image"].mean(("chain", "draw"))
+sorted_images = m3.arviz_data["posterior"]["image_name"].sortby(image_means)
+
+fig, ax = plt.subplots(1, 1, figsize=(8, 12), layout="constrained")
+ax = az.plot_forest(
+    m3.arviz_data["posterior"],
+    kind="forestplot",
+    var_names=["log_w_delta_image"],
+    coords={"image_name": sorted_images},
+    hdi_prob=0.9,
+    combined=True,
+    ridgeplot_overlap=1.5,
+    ax=ax,
+)
+ax[0].set_title("Reach width differences")
+plt.show()
+```
+
+
+## Plot per-image psychometric functions
+
+A new cool thing we can do here is to plot the psychometric functions for each image.
+First generate predictions:
+
+```{python}
+x = np.logspace(np.log10(0.3), np.log10(16), 51)
+pred_df = expand_grid(
+    {
+        "reach": x,
+        "image_name": grouped_image_df["image_name"].unique(),
+        "grain": grouped_image_df["grain"].unique(),
+    }
+)
+pred_df["participant"] = "None"
+
+# merge in correct image_condition codes for each image:
+pred_df = pred_df.merge(
+    grouped_image_df[["image_name", "image_condition"]].drop_duplicates(),
+    on="image_name",
+)
+
+pred_df, _ = PsychometricFunctionWrapper.create_grouping_ids(
+    pred_df,
+    experiment_conditions=["image_condition", "grain"],
+    group_variables=["participant", "image_name"],
+)
+
+posterior_samples = m3.predict(
+    data=pred_df,
+    prior=False,
+    sample_obs=False,
+    model_kwargs={"include_participant_re": False, "include_image_re": True},
+)
+post_pred_mean = posterior_samples["psi"].mean(axis=0)
+post_pred_hpdi = hpdi(posterior_samples["psi"], 0.9)
+pred_df["post_mean"] = post_pred_mean
+pred_df["post_lower"] = post_pred_hpdi[0]
+pred_df["post_upper"] = post_pred_hpdi[1]
+```
+
+Need to re-arrange the data here. Note that this is a bit hacky -- we're just pooling data over participants rather than taking first the participant mean, then the average of those.
+
+```{python}
+plot_df = group_bernoulli_trials_into_binomial(
+    df,
+    stimulus_intensity="reach",
+    experiment_conditions=["image_condition", "grain"],
+    group_variables=["image_name"],
+    bernoulli_outcome_column="correct",
+    use_rule_of_succession=True,
+)
+plot_df = plot_df.dropna()
+plot_df
+
+```
+
+Now plot: 
+
+```{python}
+
+plt_6 = (
+    pn.ggplot(
+        data=plot_df,
+        mapping=pn.aes(x="reach", color="image_condition", fill="image_condition"),
+    )
+    + pn.facet_grid("grain ~ image_name")
+    + pn.geom_ribbon(
+        data=pred_df,
+        mapping=pn.aes(
+            ymin="post_lower",
+            ymax="post_upper",
+        ),
+        color=None,
+        outline_type="full",
+        alpha=0.4,
+    )
+    + pn.geom_line(
+        data=pred_df,
+        mapping=pn.aes(y="post_mean"),
+        alpha=0.5,
+    )
+    + pn.geom_errorbar(mapping=pn.aes(ymin="plot_lo", ymax="plot_hi"), width=0.0)
+    + pn.geom_point(mapping=pn.aes(y="proportion_correct"), color="black")
+    + pn.scale_x_log10()
+    + pn.scale_color_manual(plot_colors)
+    + pn.scale_fill_manual(plot_colors)
+    + pn.labs(x="Reach", y="P(correct)", color="", fill="")
+    + pn.theme_bw()
+    + pn.theme(figure_size=(25, 8))
+)
+
+plt_6.save(top_dir / "figures" / "m3_psychometric_functions_by_image_wide.pdf")
+plt_6.draw()
+
+```
+
+# Model comparison
+
+Let's do a model comparison, estimating the expected log posterior density (ELPD) between the image and the no-image model.
+
+```{python}
+comp_df = az.compare({"no_image_model": m2.arviz_data, "image_model": m3.arviz_data})
+comp_df
+```
+
+First, notice that we get a few warnings here for the image model. 
+This basically indicates that we don't really have enough data to reliably estimate the leave-one-out ELPD.
+
+That aside, notice that here the model including image effects is strongly preferred,
+with a difference in ELPD of about 210 (+/- 23.2).
+This indicates strong support for the model containing image effects over a model that treats images the same and only considers variance over people.
+See McElreath, Chapter 7, for more.
+
+Arviz also makes a plot:
+
+```{python}
+fig, ax = plt.subplots(1, 1, figsize=(5, 3), layout="constrained")
+ax = az.plot_compare(comp_df, ax=ax, show=True, insample_dev=True)
+fig.savefig(top_dir / "figures" / "model_comparison.pdf")
+plt.show()
+```
+
